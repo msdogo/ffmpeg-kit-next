@@ -44,6 +44,25 @@ git commit -m "ci: build rebranded FFmpegKit for arm64-v8a"
 git push origin main
 ```
 
+### 方式 C：本机 Linux 一键构建（比 CI 快，失败能立刻看日志）
+
+仓库根目录的 `build-on-ubuntu.sh` 把整条链路封成 6 个可重入阶段：
+
+```bash
+bash build-on-ubuntu.sh                                   # 从 fork clone 源码
+bash build-on-ubuntu.sh --from-local ~/ffmpeg-kit-next    # 用本地已有源码（必须是 git 仓库）
+```
+
+- 阶段顺序 `checks → deps → sdk → src → build → pack`；`--stage build` 可从中断处接着跑
+- **编译本身也能续跑**：`scripts/main-android.sh` 用 `library_is_installed` 检查安装目录，
+  已编好的库会打印 `xxx: already built` 直接跳过。所以上次挂在第 N 个库，重跑就从第 N 个继续，
+  不会重编前面的
+- 并行数按 CPU / 内存自动推算（`--jobs` 可覆盖）；日志逐阶段 tee 到 `<workdir>/logs/`
+- `--from-local` 会预检 `tools/rebrand/`、`android.sh` 与 **`.git`**（`android.sh:39` 依赖
+  `git describe` 生成版本号，缺 `.git` 会在编译一开始就 `exit 1`）
+- **Ubuntu 26.04 注意**：系统 cmake 是 **4.x**，会拒绝 `cmake_minimum_required(<3.5)` 的老工程
+  （`libvidstab` 等）。脚本会自动让 SDK 自带的 **cmake 3.22.1** 优先并写入 `env.sh`，无需手工处理
+
 > ### ⚠️ 两个会让人卡住的点
 >
 > **1. 首次 push 不会自动触发这个 workflow。**
@@ -231,6 +250,7 @@ import com.fkit.ffmpegkit.FFmpegKit;
 | 打 AAR 阶段 `Failed to apply plugin 'com.android.internal.library'` + `Android Gradle plugin requires Java 17 to run. You are currently using Java 11.` | **runner 默认 JDK 是 11，而 `android/build.gradle` 用的 AGP 8.13.2 硬性要求 17+**。早先 workflow 靠手写 `${JAVA_HOME_17_X86_64}` 探测，但这个变量名在 runner 镜像里不保证存在；一旦取空，`if` 分支静默跳过、步骤仍显示 success，直到**最后一步**才以「Java 11」暴露，代价是白跑整轮编译。现已改为 `actions/setup-java@v6`（temurin / 17）+ `Verify JDK >= 17` 硬校验，`package-aar.sh` 里也自带一道断言。注意这步失败时**前面 9 步全绿**（55 个外部库 + ffmpeg 都已编译完成），所以此时直接重跑很亏 |
 | 打 AAR 阶段 `[package-aar] ERROR: gradle 需要 JDK 17 或更高（AGP 8.13.2），当前为：Picked up JAVA_TOOL_OPTIONS: ...` | **版本探测被脚本自己设的环境变量污染**。`package-aar.sh` 为了强制 gradle 输出英文会 `export JAVA_TOOL_OPTIONS="... -Duser.language=en -Duser.country=US"`，而 JVM 每次启动都会先往 **stderr** 吐一行 `Picked up JAVA_TOOL_OPTIONS: ...`。原来用 `java -version 2>&1 \| head -n 1` 取首行当版本串，取到的正是这行垃圾 → 解析不出主版本 → 误判「JDK 不足 17」直接 die。**诡异之处：同一次 run 里 `Verify JDK >= 17` 步骤是绿的**（该步骤没设 `JAVA_TOOL_OPTIONS`，首行是真版本行），于是表现为「校验通过、打包却挂」。现已改为**优先读 `$JAVA_HOME/release`**（JVM 规范文件，不受环境变量与 locale 影响），仅在读不到时才回落解析 `java -version`，且用 `version "…"` 引号锚定以天然跳过 `Picked up` 行。`package-aar.sh` 与 workflow 两处写法已统一 |
 | 打 AAR 阶段 dokka 相关失败（`org.jetbrains.dokka` 插件加载异常 / Kotlin 版本不兼容） | 上游模块 `build.gradle` 无条件 `apply plugin: 'org.jetbrains.dokka'` 并注册 `dokkaJavadocJar`，把 **Kotlin ↔ Dokka 版本矩阵**耦了进来（上游组合是 Kotlin 2.0.21 + Dokka 1.9.20）。我们只要 AAR、不需要 javadoc jar，`rebrand-sources.sh` **第 5b 步**会移除该插件行与整个任务块（awk 按花括号配平删除，幂等；找不到 dokka 痕迹就整段跳过） |
+| 编译外部库阶段 `libvidstab: failed`，`build.log` 里是 `CMake Error at CMakeLists.txt:1 (cmake_minimum_required): Compatibility with CMake < 3.5 has been removed from CMake.` | **本机 cmake 太新**。CMake **4.0** 把 `cmake_minimum_required(<3.5)` 从「弃用警告」升级成了**硬错误**，而 ffmpeg-kit 钉的 `arthenica/vid.stab v1.1.1` 写的正是 `cmake_minimum_required (VERSION 2.8.5)` ⇒ 必挂。**Ubuntu 26.04 自带的 cmake 是 4.2.3**，CI 用的 ubuntu-24.04 是 3.x，所以 CI 上不会踩。两种处理：①（推荐）让 SDK 自带的 **cmake 3.22.1** 优先，与上游 CI 装的是同一个版本 —— `build-on-ubuntu.sh` 的 `sdk` 阶段已自动 `export PATH="$SDK/cmake/3.22.1/bin:$PATH"` 并写进 `env.sh`，手工跑时补一句 `export PATH="$ANDROID_SDK_ROOT/cmake/3.22.1/bin:$PATH"` 亦可；② 图快就用 CMake 4.0 官方为此新增的环境变量 `export CMAKE_POLICY_VERSION_MINIMUM=3.5`（旧版 cmake 会忽略它，无副作用）。**注意**：`soxr` / `chromaprint` 等同样是老工程，不处理会一个个接着挂 |
 | 链接阶段 OOM / `No space left on device` | 把 `BUILD_OPTS` 改成 `--jobs=2` 并加上 `--no-link-time-optimization`；同时确认 `Free disk space` 步骤没被删 |
 | 超过 6 小时被 kill | 同上（关掉 LTO 能省很多时间），或去掉几个用不到的大库（如 `--disable-lib-tesseract --disable-lib-svtav1`） |
 | `找不到 sdkmanager` | 把 workflow 里 `Set up Android SDK / NDK` 步骤替换成 `uses: android-actions/setup-android@v3` |

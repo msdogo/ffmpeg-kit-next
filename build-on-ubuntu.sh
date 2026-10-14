@@ -251,6 +251,24 @@ do_checks() {
     c_warn "未找到 curl（deps 阶段会装）"
   fi
 
+  # CMake 版本预警：Ubuntu 26.04 自带 cmake 4.x，而 CMake 4.0 起对
+  # cmake_minimum_required(<3.5) 是硬错误。libvidstab / soxr 这类老工程会直接挂。
+  # 脚本会用 SDK 自带的 3.22.1（与上游 CI 一致），这里只做提示。
+  if need_cmd cmake; then
+    local SYSCMAKE VER MAJ
+    VER="$(cmake --version 2>/dev/null | head -n 1)"
+    SYSCMAKE="$(command -v cmake)"
+    MAJ="$(printf '%s' "${VER}" | sed -n 's/.*version[[:space:]]*\([0-9][0-9]*\).*/\1/p')"
+    if [ -n "${MAJ}" ] && [ "${MAJ}" -ge 4 ]; then
+      c_warn "系统 cmake 是 ${VER}（${SYSCMAKE}）——4.x 会拒绝 cmake_minimum_required(<3.5) 的老工程。"
+      c_warn "本脚本会让 SDK 自带的 CMake ${CMAKE_VERSION} 优先，无需你手工处理。"
+    else
+      c_info "系统 cmake：${VER}"
+    fi
+  else
+    c_info "未找到系统 cmake（deps 阶段会装；真正构建用的是 SDK 自带的 ${CMAKE_VERSION}）"
+  fi
+
   if [ -n "${FROM_LOCAL}" ]; then
     [ -d "${FROM_LOCAL}/tools/rebrand" ] || c_die "--from-local 指向的目录里没有 tools/rebrand/：${FROM_LOCAL}
       ⇒ 这不是「已含改名脚本的 fork」，很可能是上游 arthenica 原版（它不改名，编出来
@@ -441,6 +459,22 @@ do_sdk() {
 
   [ -d "${SDK_DIR}/ndk/${NDK_VERSION}" ] || c_die "NDK ${NDK_VERSION} 安装失败"
   c_ok "NDK：$(sed -n 's/^Pkg.Revision[[:space:]]*=[[:space:]]*//p' "${SDK_DIR}/ndk/${NDK_VERSION}/source.properties")"
+
+  # ---- CMake：必须优先用 SDK 自带的那份（默认 3.22.1）----
+  # Ubuntu 26.04 的系统 cmake 是 4.x；CMake 4.0 起对 cmake_minimum_required(<3.5)
+  # 由「弃用警告」变为**硬错误**，arthenica/vid.stab v1.1.1（VERSION 2.8.5）会直接挂。
+  local SDK_CMAKE="${SDK_DIR}/cmake/${CMAKE_VERSION}/bin"
+  if [ -x "${SDK_CMAKE}/cmake" ]; then
+    export PATH="${SDK_CMAKE}:${PATH}"
+    c_ok "CMake：${SDK_CMAKE}/cmake（$("${SDK_CMAKE}/cmake" --version | head -n 1)）"
+  else
+    c_warn "没找到 SDK 自带的 CMake ${CMAKE_VERSION}（${SDK_CMAKE}）"
+    c_warn "将回落到系统 cmake：$(command -v cmake >/dev/null 2>&1 && cmake --version | head -n 1 || echo '未安装')"
+    c_warn "若系统 cmake 是 4.x，libvidstab 等老工程会报「Compatibility with CMake < 3.5 has been removed」"
+  fi
+  # 双保险：官方为 CMake 4.x 提供的兼容开关（旧版 cmake 会忽略）
+  export CMAKE_POLICY_VERSION_MINIMUM=3.5
+  c_info "CMAKE_POLICY_VERSION_MINIMUM=${CMAKE_POLICY_VERSION_MINIMUM}（兼容老 CMake 工程）"
 }
 
 # ===========================================================================
@@ -517,7 +551,14 @@ export JAVA_HOME="${JH}"
 export ANDROID_SDK_ROOT="${SDK_DIR}"
 export ANDROID_HOME="${SDK_DIR}"
 export ANDROID_NDK_ROOT="${SDK_DIR}/ndk/${NDK_VERSION}"
-export PATH="\${JAVA_HOME}/bin:\${ANDROID_SDK_ROOT}/platform-tools:\${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin:\${PATH}"
+# CMake 必须让 SDK 自带的 ${CMAKE_VERSION} 优先：Ubuntu 26.04 的系统 cmake 是 4.x，
+# 而 CMake 4.0 起移除了对 cmake_minimum_required(<3.5) 的兼容，会**直接报错**。
+# ffmpeg-kit 钉的 arthenica/vid.stab v1.1.1 里写的就是 VERSION 2.8.5，必挂。
+# CI 侧装的也正是 3.22.1，这里保持一致。
+export PATH="\${ANDROID_SDK_ROOT}/cmake/${CMAKE_VERSION}/bin:\${JAVA_HOME}/bin:\${ANDROID_SDK_ROOT}/platform-tools:\${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin:\${PATH}"
+# 双保险：万一某些阶段仍落到系统 cmake 4.x，这个官方开关能让老工程继续配置。
+# CMake 4.0 新增的环境变量（用于初始化 CMAKE_POLICY_VERSION_MINIMUM），旧版 cmake 会忽略它。
+export CMAKE_POLICY_VERSION_MINIMUM=3.5
 export ANDROID_NDK_HOME="\${ANDROID_NDK_ROOT}"
 EOF
   c_ok "环境文件：${ENV_FILE}"
