@@ -192,6 +192,25 @@ pick_system_jdk() {
 
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+# 把 Windows 侧遗留的 CRLF 统一成 LF。这个不是"洁癖"，是硬需求：
+#   - .patch 带 CRLF → Linux 的 git apply 直接拒绝，报 "does not apply cleanly"
+#     （SDL 的 configure.android-opensles.patch 上实测踩到，整轮构建挂在 sdl: failed）
+#   - shell 脚本带 CRLF → "bad interpreter: ...bash\r"
+# tools/ 下全是文本（补丁 + 改名脚本），整目录清一遍最省事；
+# 根目录文件 + 构建关键扩展名再覆盖一次；src/ 是上游 clone 的库源码（本来就 LF），跳过。
+crlf_to_lf() {
+  local root="$1"
+  [ -n "${root}" ] && [ -d "${root}" ] || return 0
+  find "${root}/tools" -type f -print0 2>/dev/null \
+    | xargs -0 -r sed -i 's/\r$//' 2>/dev/null || true
+  find "${root}" -type f -not -path '*/.git/*' -not -path "${root}/src/*" \
+    \( -name '*.sh' -o -name '*.py' -o -name '*.mk' -o -name 'Makefile*' \
+       -o -name '*.config' -o -name '*.patch' -o -name '*.in' -o -name '*.am' \
+       -o -name '*.ac' -o -name 'configure' \) -print0 2>/dev/null \
+    | xargs -0 -r sed -i 's/\r$//' 2>/dev/null || true
+  return 0
+}
+
 # 取目标 Java 包名，用于 android.sh 的 --package-name。
 # 配置里写的是参数展开形式 ${REBRAND_JAVA_PACKAGE:-com.fkit.ffmpegkit}，
 # 直接 sed 取 `:-` 后面的默认值即可，避免 source 整个文件引入副作用。
@@ -491,12 +510,16 @@ do_src() {
     else
       c_info "从本地复制源码：${FROM_LOCAL} -> ${SRC_DIR}"
       mkdir -p "${SRC_DIR}"
-      # 保留 .git：android.sh 里 `git describe --tags --always` 会用
-      rsync -a --delete "${FROM_LOCAL}/" "${SRC_DIR}/"
-      # 双保险：Windows 侧过来的文件若带 CRLF，会让 #!/usr/bin/env bash 变成
-      # `...bash\r` 而报 "bad interpreter"。这里统一清成 LF。
-      find "${SRC_DIR}" -type f \( -name '*.sh' -o -name '*.py' -o -name '*.mk' -o -name 'Makefile*' -o -name '*.config' \) -print0 \
-        | xargs -0 -r sed -i 's/\r$//' 2>/dev/null || true
+      # 保留 .git：android.sh 里 `git describe --tags --always` 会用。
+      # 必须排除构建产物目录：否则重跑 --from-local 会把已下载的第三方源码
+      # （src/）、已编译好的库（prebuilt/）与日志当成「多余文件」删掉，全部重来。
+      rsync -a --delete \
+        --exclude='src/' \
+        --exclude='prebuilt/' \
+        --exclude='.tmp/' \
+        --exclude='build.log' \
+        "${FROM_LOCAL}/" "${SRC_DIR}/"
+      crlf_to_lf "${SRC_DIR}"
       c_ok "源码就绪（已统一为 LF）"
     fi
   fi
@@ -573,6 +596,10 @@ do_build() {
   [ "${DRY_RUN}" = "1" ] || { [ -f "${ENV_FILE}" ] || write_env_file; }
   # shellcheck disable=SC1090
   [ "${DRY_RUN}" = "1" ] || source "${ENV_FILE}"
+
+  # 幂等兜底：--stage build 会跳过 do_src，这里必须再清一次 CRLF。
+  # .patch 一旦带 CRLF，Linux 的 git apply 会直接拒绝（SDL 上实测踩到）。
+  [ "${DRY_RUN}" = "1" ] || crlf_to_lf "${SRC_DIR}"
 
   [ "${DRY_RUN}" = "1" ] || mkdir -p "${LOGS}"
 

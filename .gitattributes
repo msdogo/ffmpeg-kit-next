@@ -1,6 +1,24 @@
-# 保证 shell 脚本和 makefile 在任何平台上进出仓库都保持 LF，
-# 否则在 Windows 上 checkout/commit 可能写入 CRLF，导致 CI 里 bash 报
-# "bad interpreter" / "$'\r': command not found"
-*.sh   text eol=lf
-*.env  text eol=lf
-*.mk   text eol=lf
+# 跨平台一致性：本项目只在 Linux（GitHub CI / 本机 WSL）上编译，任何 CRLF 都会
+# 造成真实故障，而不是「无害的排版差异」：
+#   - shell 脚本报 "bad interpreter: ...bash\r" / "$'\r': command not found"
+#   - git apply 直接拒绝补丁，报 "patch does not apply cleanly"
+#   - automake / autoconf 解析 configure.ac / Makefile.am 异常
+#
+# 【踩坑记录】本规则表原先只列了 *.sh / *.env / *.mk，漏掉 *.patch。
+# Windows 上 checkout 时这些 .patch 被写成 CRLF，--from-local 拷进 WSL 后
+# SDL 的 configure.android-opensles.patch 应用失败，整轮构建挂在 "sdl: failed"。
+# 排查时 git show HEAD:<patch> 是 LF（仓库里没错），但工作区是 CRLF —— 差异就在这。
+#
+# 现在统一：所有文本文件 LF，只有 Windows 批处理保留 CRLF。
+* text=auto eol=lf
+*.bat  text eol=crlf
+
+# 下面是构建关键类型，显式再声明一次，防止将来上面兜底规则被改动时重新漏掉。
+*.sh     text eol=lf
+*.env    text eol=lf
+*.mk     text eol=lf
+*.patch  text eol=lf
+*.am     text eol=lf
+*.in     text eol=lf
+*.ac     text eol=lf
+configure text eol=lf
