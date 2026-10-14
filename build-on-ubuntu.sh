@@ -35,6 +35,7 @@ WORKDIR="${HOME}/ffmpeg-kit-build"
 STAGE="checks"
 JOBS=""
 FROM_LOCAL=""
+PKG_NAME=""         # 空=从 tools/rebrand/rebrand.config.env 自动取
 BRANCH="main"
 CLONE_URL="https://github.com/msdogo/ffmpeg-kit-next.git"
 DRY_RUN=0
@@ -73,6 +74,9 @@ usage() {
   --branch REF       clone 的分支/标签，默认 main
   --clone-url URL    fork 地址，默认 msdogo/ffmpeg-kit-next
   --api-level N      Android API level，默认 24
+  --package-name P   原生侧上报的包名（对应 android.sh --package-name），
+                     默认从 tools/rebrand/rebrand.config.env 的
+                     REBRAND_JAVA_PACKAGE 自动读取
   --dry-run          只打印将执行的命令
   -h | --help        显示本帮助
 EOF
@@ -90,6 +94,8 @@ while [ $# -gt 0 ]; do
     --branch)     BRANCH="${2:?--branch 需要值}"; shift 2 ;;
     --clone-url)  CLONE_URL="${2:?--clone-url 需要值}"; shift 2 ;;
     --api-level)  API_LEVEL="${2:?--api-level 需要值}"; shift 2 ;;
+    --package-name)    PKG_NAME="${2:?--package-name 需要值}"; shift 2 ;;
+    --package-name=*)  PKG_NAME="${1#--package-name=}"; shift ;;
     --dry-run)    DRY_RUN=1; shift ;;
     -h|--help)    usage; exit 0 ;;
     *)            c_die "未知参数：$1（用 --help 看用法）" ;;
@@ -186,6 +192,18 @@ pick_system_jdk() {
 
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+# 取目标 Java 包名，用于 android.sh 的 --package-name。
+# 配置里写的是参数展开形式 ${REBRAND_JAVA_PACKAGE:-com.fkit.ffmpegkit}，
+# 直接 sed 取 `:-` 后面的默认值即可，避免 source 整个文件引入副作用。
+detect_pkg_name() {
+  local f="$1/tools/rebrand/rebrand.config.env" v=""
+  if [ -r "${f}" ]; then
+    v="$(sed -n 's/.*REBRAND_JAVA_PACKAGE:-\([^}"]*\)}.*/\1/p' "${f}" | head -n 1)"
+  fi
+  [ -n "${v}" ] || v="com.fkit.ffmpegkit"
+  printf '%s' "${v}"
+}
+
 # ===========================================================================
 #  阶段 1：checks
 # ===========================================================================
@@ -234,8 +252,36 @@ do_checks() {
   fi
 
   if [ -n "${FROM_LOCAL}" ]; then
-    [ -d "${FROM_LOCAL}/tools/rebrand" ] || c_die "--from-local 指向的目录里没有 tools/rebrand：${FROM_LOCAL}"
-    c_ok "本地源码：${FROM_LOCAL}"
+    [ -d "${FROM_LOCAL}/tools/rebrand" ] || c_die "--from-local 指向的目录里没有 tools/rebrand/：${FROM_LOCAL}
+      ⇒ 这不是「已含改名脚本的 fork」，很可能是上游 arthenica 原版（它不改名，编出来
+        仍是 libav*.so，会与 DJI SDK 冲突）。请换成本 fork 的目录，或去掉 --from-local
+        让脚本从 fork clone。"
+    [ -f "${FROM_LOCAL}/android.sh" ] || c_die "--from-local 指向的目录里没有 android.sh：${FROM_LOCAL}"
+    [ -f "${FROM_LOCAL}/tools/rebrand/rebrand-sources.sh" ] \
+      || c_die "--from-local 里缺少 tools/rebrand/rebrand-sources.sh：${FROM_LOCAL}（fork 不完整）"
+    # .git 是硬依赖：android.sh:39 跑 `git describe --tags --always` 取 BUILD_VERSION，
+    # 第 118 行发现为空会直接 "Can not run git commands in this folder" + exit 1。
+    # 所以 --from-local 必须是**可用的 git 仓库**（zip 解压 / 裸拷文件都不行）。
+    [ -d "${FROM_LOCAL}/.git" ] || c_die "--from-local 指向的目录不是 git 仓库（缺 .git）：${FROM_LOCAL}
+      android.sh 依赖 git 生成版本号，缺 .git 会在编译一开始就 exit 1。
+      二选一：
+        (a) 用它 clone 一份：git clone https://github.com/msdogo/ffmpeg-kit-next.git
+        (b) 就地把它变成 git 仓库：
+            cd \"${FROM_LOCAL}\" && git init -q && git add -A \\
+              && git -c user.email=a@b -c user.name=a commit -qm init"
+    if need_cmd git; then
+      local _desc
+      if _desc="$(git -C "${FROM_LOCAL}" describe --tags --always 2>&1)"; then
+        c_ok "本地源码：${FROM_LOCAL}（git describe: ${_desc}）"
+      else
+        c_die "--from-local 的 .git 存在但无法执行 git describe（对象库可能损坏或没有任何提交）：
+        ${_desc}
+      请改用 clone 模式，或按上面的 (b) 重建一个可用仓库。"
+      fi
+    else
+      c_warn "--from-local 已给出，但当前没有 git 可用于预检（deps 阶段会装）"
+      c_ok "本地源码：${FROM_LOCAL}"
+    fi
   fi
   c_ok "并行编译数：${JOBS}"
 }
@@ -489,8 +535,14 @@ do_build() {
 
   [ "${DRY_RUN}" = "1" ] || mkdir -p "${LOGS}"
 
-  local BUILD_OPTS
-  BUILD_OPTS="--arch=arm64-v8a --enable-lib-all --enable-gpl --disable-lib-gnutls --api-level=${API_LEVEL} --no-archive --jobs=${JOBS}"
+  local BUILD_OPTS PKG
+  # 与 CI workflow 的 android.sh 调用保持一致：同样传 --package-name。
+  # 它只影响原生侧上报的包名字符串（FFmpegKitConfig 初始化日志前缀、
+  # Packages.getPackageName() 的返回值），不影响 JNI 符号匹配——符号匹配由
+  # rebrand-sources.sh 改名保证。但两处不一致会让产物行为不同，故一并传上。
+  PKG="${PKG_NAME}"
+  [ -n "${PKG}" ] || PKG="$(detect_pkg_name "${SRC_DIR}")"
+  BUILD_OPTS="--arch=arm64-v8a --enable-lib-all --enable-gpl --disable-lib-gnutls --api-level=${API_LEVEL} --no-archive --jobs=${JOBS} --package-name=${PKG}"
 
   c_info "构建参数：${BUILD_OPTS}"
   c_info "日志目录：${LOGS}"
