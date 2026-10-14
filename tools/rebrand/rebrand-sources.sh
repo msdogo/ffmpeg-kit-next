@@ -212,7 +212,45 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 9. 结果自检 + 摘要
+# 9. 修上游 meson cross file 的 pkg-config 键名 bug（rubberband 构建失败根因）
+#
+#    scripts/function-android.sh 的 create_mason_cross_file() 生成的是：
+#        [binaries]
+#        ...
+#        pkg-config = 'pkg-config'     <-- 键名错了
+#
+#    而 meson 在 [binaries] 里认的键名是 **pkgconfig**（不带连字符）。关键在于
+#    meson 定位 pkg-config 时用的是：
+#        find_external_program(env, for_machine, 'pkgconfig', 'Pkg-config',
+#                              environment.default_pkgconfig,
+#                              allow_default_for_cross=False)
+#    allow_default_for_cross=False 意味着【交叉编译时不会回退到 PATH 去找
+#    pkg-config】，只认 cross file 里的 'pkgconfig' 键。键名写错 -> meson 认为
+#    系统没有 pkg-config -> 打印红色 'Found Pkg-config: NO'
+#    (mesonbuild/dependencies/pkgconfig.py) -> 所有 dependency() 探测失败。
+#
+#    影响面：本仓库用 meson 构建的库只有 dav1d / harfbuzz / liblc3 / rubberband，
+#    其中只有 rubberband 需要外部依赖（libsamplerate），所以只有它会炸：
+#        meson.build:317:4: ERROR: C++ header 'samplerate.h' not found
+#    这是上游在非 Nix 路径上的真实缺陷，这里就地修正。修正后 pkg-config 会被正常
+#    调用，并继承 run-android.sh 导出的 PKG_CONFIG_LIBDIR（= INSTALL_PKG_CONFIG_DIR，
+#    其中已有 libsamplerate.sh 拷进去的 samplerate.pc），探测即可通过。
+# ---------------------------------------------------------------------------
+FUNC_ANDROID_SH="${ROOT}/scripts/function-android.sh"
+[ -f "${FUNC_ANDROID_SH}" ] || die "找不到 ${FUNC_ANDROID_SH}"
+
+if grep -qF "pkgconfig = 'pkg-config'" "${FUNC_ANDROID_SH}"; then
+  log "meson cross file 键名已是 pkgconfig（跳过）"
+elif grep -qF "pkg-config = 'pkg-config'" "${FUNC_ANDROID_SH}"; then
+  sed -i "s|^pkg-config = 'pkg-config'|pkgconfig = 'pkg-config'|" "${FUNC_ANDROID_SH}"
+  grep -qF "pkgconfig = 'pkg-config'" "${FUNC_ANDROID_SH}" || die "meson cross file 键名替换失败"
+  log "已修正 meson cross file：pkg-config -> pkgconfig（rubberband 探测 libsamplerate 用）"
+else
+  die "在 ${FUNC_ANDROID_SH##*/} 里找不到 \"pkg-config = 'pkg-config'\"，上游结构可能已变，请人工确认"
+fi
+
+# ---------------------------------------------------------------------------
+# 10. 结果自检 + 摘要
 # ---------------------------------------------------------------------------
 printf '\n'
 log "==== 改名配置摘要 ===="

@@ -108,9 +108,11 @@ git push origin main
      ├ gradle：namespace + base.archivesName
      ├ android/jni/ffmpeg/Android.mk：7 个 prebuilt 库的 module/src 名
      ├ android/jni/Android.mk：包装库模块名 + LOCAL_SHARED_LIBRARIES
-     └ 给 scripts/android/ffmpeg.sh 注入 SLIBPREF=lib<前缀>_
-        （configure 之后改 ffbuild/config.mak，让 ffmpeg 直接产出新名字，
-          SONAME 和 DT_NEEDED 天然正确，不需要二次改 ELF）
+     ├ 给 scripts/android/ffmpeg.sh 注入 SLIBPREF=lib<前缀>_
+     │  （configure 之后改 ffbuild/config.mak，让 ffmpeg 直接产出新名字，
+     │    SONAME 和 DT_NEEDED 天然正确，不需要二次改 ELF）
+     └ 修上游 meson cross file 键名 bug：scripts/function-android.sh 里
+        `pkg-config = ...` → `pkgconfig = ...`（否则 rubberband 构建必失败）
 
 2) ./android.sh --arch=arm64-v8a --enable-lib-all --enable-gpl --api-level=24
       --no-archive --package-name=com.fkit.ffmpegkit
@@ -204,12 +206,63 @@ import com.fkit.ffmpegkit.FFmpegKit;
 
 | 现象 | 处理 |
 | --- | --- |
+| `E: Unable to locate package xxx`（exit 100，几秒就死） | apt 源里没有这个包名。workflow 已改成**逐个 `apt-cache show` 探测**再安装，不存在的会 `::warning::` 跳过而不再整步失败 |
+| `WARNING: 'asn1Parser' is missing on your system` + `make[2]: *** [..._asn1_tab.c] Error 127` | **gnutls 的隐式主机依赖**。gnutls 是 git 克隆 + submodule 构建，源码树里没有预生成的 `gnutls_asn1_tab.c` / `pkix_asn1_tab.c`，必须由 `asn1Parser` 现场生成。Ubuntu 上该工具在 **`libtasn1-bin`** 包里（默认 apt 列表已含）。注意 `gnutls.sh` 自身**完全不做工具检查**，漏装只会在编译到第 44 个库时才暴露 |
+| `Found Pkg-config: NO` + `meson.build:317:4: ERROR: C++ header 'samplerate.h' not found`，`rubberband: failed` | **上游 meson cross file 键名 bug**（`scripts/function-android.sh` 的 `create_mason_cross_file` 写了 `pkg-config = ...`，而 meson 认的键是 `pkgconfig`，且交叉编译时 `allow_default_for_cross=False` 不回退 PATH）。`rebrand-sources.sh` 第 9 步已就地修正为 `pkgconfig = 'pkg-config'`。详见下方说明 |
 | 链接阶段 OOM / `No space left on device` | 把 `BUILD_OPTS` 改成 `--jobs=2` 并加上 `--no-link-time-optimization`；同时确认 `Free disk space` 步骤没被删 |
 | 超过 6 小时被 kill | 同上（关掉 LTO 能省很多时间），或去掉几个用不到的大库（如 `--disable-lib-tesseract --disable-lib-svtav1`） |
 | `找不到 sdkmanager` | 把 workflow 里 `Set up Android SDK / NDK` 步骤替换成 `uses: android-actions/setup-android@v3` |
 | 校验步骤报「仍然存在旧 ffmpeg 库名」 | 说明 SLIBPREF 注入和 patchelf 兜底都没成功，看 `build.log` 里 `INFO: rebrand:` 那几行 |
 | 运行时 `UnsatisfiedLinkError` | 确认 APK 里 `lib/arm64-v8a/` 下是 `libfkit_*` 而不是 `libav*`；确认 App 代码里没有 `System.loadLibrary("ffmpegkit")` 之类硬编码 |
 | 想改前端名字 | 改 `env` 里的 `REBRAND_NATIVE_PREFIX` / `REBRAND_JAVA_PACKAGE` 重跑即可（脚本幂等） |
+
+> **主机工具清单的权威来源**：上游 `flake.nix` 的 `commonToolPackages` + `androidPackages` 就是 Nix 构建成功时的完整 host 依赖集。本 workflow 的 apt 列表已与它逐项对齐（含容易漏的 `libtasn1`）。如果又遇到 `Error 127` 类问题，先回去对比这份清单。
+>
+> 失败时 workflow 会额外上传 `build-log-<run_number>` 产物，里面有完整 `build.log`；`Show build log tail on failure` 步骤也会打印末尾 800 行 + 所有 `ERROR` 行 + 各外部库 `ok/failed` 汇总。
+
+### 关于 rubberband / meson `Found Pkg-config: NO`（已修，留个记录）
+
+这是上游在**非 Nix 路径**上的真实缺陷，不是我们的改名引入的：
+
+```bash
+# scripts/function-android.sh
+create_mason_cross_file() {
+  cat >"$1" <<EOF
+[binaries]
+c = '$CC'
+...
+pkg-config = 'pkg-config'   # ← 键名错了，meson 认的是 pkgconfig
+```
+
+meson 定位 pkg-config 时走的是：
+
+```python
+# mesonbuild/dependencies/pkgconfig.py
+find_external_program(env, for_machine, 'pkgconfig', 'Pkg-config',
+                      environment.default_pkgconfig,
+                      allow_default_for_cross=False)   # ← 交叉编译不回退 PATH
+```
+
+`BinaryTable` 存键是原样保存、`lookup_entry('pkgconfig')` 是精确匹配，
+所以 `pkg-config` 这个键等于没写；再加上交叉编译禁用了默认 PATH 回退，
+meson 直接判定「本机没有 pkg-config」，打印红色 `Found Pkg-config: NO`。
+
+本仓库用 meson 的只有 `dav1d` / `harfbuzz` / `liblc3` / `rubberband`，
+前三个没有外部依赖所以看不出来，只有 rubberband 需要 `libsamplerate` 时炸：
+
+```
+Run-time dependency samplerate found: NO (tried pkgconfig and cmake)
+meson.build:317:4: ERROR: C++ header 'samplerate.h' not found
+```
+
+修好后 pkg-config 会被正常调用，并继承 `scripts/run-android.sh` 导出的
+`PKG_CONFIG_LIBDIR`（= `prebuilt/android-arm64-24/pkgconfig`，
+`libsamplerate.sh` 结尾已经把 `samplerate.pc` 拷进这个目录），探测即通过。
+
+> 另外注意：**rubberband 是 GPL 库**，`--enable-lib-all` 想把它编进去就绕不开
+> `--enable-gpl`。反过来，一旦去掉 `--enable-gpl`，`enable_all_libraries()`
+> 会按 `is_gpl_licensed` 把 `x264/x265/xvidcore/libvidstab/rubberband` 全部跳过，
+> 这个 meson 问题也就不会出现了。
 
 ### 无 CI，本地 / 其他机器上编译
 
