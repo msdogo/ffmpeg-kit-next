@@ -107,16 +107,52 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential gcc g++ make cmake ninja-build meson \
-            autoconf automake libtool libtool-bin autopoint m4 \
-            pkg-config bison flex gperf ragel autogen \
-            nasm yasm \
-            gettext texinfo groff gawk \
-            doxygen gtk-doc-tools \
-            python3 python3-pip perl ruby \
-            rsync zip unzip wget curl gnupg ca-certificates file patch which \
+
+          # 逐个探测可安装性，再一次性安装。
+          # 原因：不同镜像 / 发行版的软件源里个别包名可能并不存在，
+          # 例如 ubuntu-22.04 的 apt 源中就没有名为 which 的独立包
+          # （which 命令由 debianutils 提供），
+          # 直接整串 apt-get install 会因一个包定位失败而整步 exit 100。
+          PKGS="
+            build-essential gcc g++ make cmake ninja-build meson
+            autoconf automake libtool libtool-bin autopoint m4
+            pkg-config bison flex gperf ragel autogen
+            nasm yasm
+            gettext texinfo groff gawk
+            doxygen gtk-doc-tools
+            python3 python3-pip perl ruby
+            rsync zip unzip wget curl gnupg ca-certificates file patch
+            debianutils
             libtasn1-6-dev zlib1g-dev patchelf
+          "
+          INSTALL=""
+          SKIPPED=""
+          for p in ${PKGS}; do
+            if apt-cache show "${p}" >/dev/null 2>&1; then
+              INSTALL="${INSTALL} ${p}"
+            else
+              SKIPPED="${SKIPPED} ${p}"
+            fi
+          done
+          if [ -n "${SKIPPED}" ]; then
+            echo "::warning::以下包在当前 apt 源中不存在，已跳过：${SKIPPED}"
+          fi
+          echo "将安装：${INSTALL}"
+          # shellcheck disable=SC2086
+          sudo apt-get install -y --no-install-recommends ${INSTALL}
+
+          # 关键工具自检：这些是构建与改名脚本真正依赖的，缺任何一个都提前失败
+          MISSING=""
+          for t in make cmake ninja meson patchelf nasm yasm autoconf automake \
+                   libtoolize bison flex gperf ragel python3 perl pkg-config \
+                   gawk patch zip unzip file which; do
+            command -v "${t}" >/dev/null 2>&1 || MISSING="${MISSING} ${t}"
+          done
+          if [ -n "${MISSING}" ]; then
+            echo "::error::关键构建工具缺失：${MISSING}"
+            exit 1
+          fi
+          echo "主机构建依赖就绪"
 
       - name: Select JDK 17
         run: |
@@ -195,7 +231,7 @@ jobs:
             echo ""
             echo "| 项 | 值 |"
             echo "| --- | --- |"
-            echo "| FFmpegKit 版本 | $(sed -n 's/.*#define FFMPEG_KIT_VERSION "$[^"]*$".*/\1/p' android/ffmpeg-kit-next-android-lib/src/main/cpp/ffmpegkit.h | head -1) |"
+            echo "| FFmpegKit 版本 | $(sed -n 's/.*#define FFMPEG_KIT_VERSION "\([^"]*\)".*/\1/p' android/ffmpeg-kit-next-android-lib/src/main/cpp/ffmpegkit.h | head -1) |"
             echo "| ABI | arm64-v8a |"
             echo "| 动态库前缀 | lib${REBRAND_NATIVE_PREFIX}* |"
             echo "| Java 包名 | ${REBRAND_JAVA_PACKAGE} |"
