@@ -100,6 +100,11 @@ jobs:
           sudo rm -rf /usr/local/lib/android/sdk/emulator || true
           sudo rm -rf /usr/local/lib/android/sdk/sources || true
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/share/swift || true
+          # 全量外部库（50+ 个）的源码树 + 中间产物相当占地方，
+          # 这几个是 runner 上体积大且本次完全用不到的目录。
+          # 注意：不能删 /opt/hostedtoolcache 整体 —— JDK 17 就在里面。
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /opt/az /usr/lib/R /opt/microsoft || true
           sudo docker image prune -af || true
           df -h /
 
@@ -123,8 +128,15 @@ jobs:
             python3 python3-pip perl ruby
             rsync zip unzip wget curl gnupg ca-certificates file patch
             debianutils
-            libtasn1-6-dev zlib1g-dev patchelf
+            libtasn1-bin libtasn1-6-dev zlib1g-dev patchelf
           "
+          # ★ libtasn1-bin 提供 asn1Parser，是 gnutls 的隐式构建依赖。
+          #   gnutls 走 git 克隆（含 libtasn1 submodule）方式构建，源码树里
+          #   没有预生成的 gnutls_asn1_tab.c / pkix_asn1_tab.c，必须由
+          #   asn1Parser 现场从 lib/*.asn 生成；缺它会出现
+          #   “WARNING: 'asn1Parser' is missing on your system”
+          #   并以 make Error 127 失败（实测踩过）。
+          #   上游 flake.nix 的 host 工具清单里也带了 libtasn1。
           INSTALL=""
           SKIPPED=""
           for p in ${PKGS}; do
@@ -141,10 +153,14 @@ jobs:
           # shellcheck disable=SC2086
           sudo apt-get install -y --no-install-recommends ${INSTALL}
 
-          # 关键工具自检：这些是构建与改名脚本真正依赖的，缺任何一个都提前失败
+          # 关键工具自检：这些是构建与改名脚本真正依赖的，缺任何一个都提前失败。
+          # asn1Parser 来自 libtasn1-bin，是 gnutls 编译的隐式依赖，
+          # gnutls.sh 里没有任何工具检查，漏装时只会在编译到第 44 个库时
+          # 才以 make Error 127 暴露，代价是白跑 20 多分钟，所以在这里兜住。
           MISSING=""
           for t in make cmake ninja meson patchelf nasm yasm autoconf automake \
-                   libtoolize bison flex gperf ragel python3 perl pkg-config \
+                   libtoolize autoreconf autogen bison flex gperf ragel \
+                   asn1Parser python3 perl pkg-config \
                    gawk patch zip unzip file which; do
             command -v "${t}" >/dev/null 2>&1 || MISSING="${MISSING} ${t}"
           done
@@ -153,6 +169,8 @@ jobs:
             exit 1
           fi
           echo "主机构建依赖就绪"
+          # 明确打印 asn1Parser 路径，方便日后排查 gnutls 相关构建问题
+          echo "asn1Parser 位置: $(command -v asn1Parser)"
 
       - name: Select JDK 17
         run: |
@@ -252,10 +270,27 @@ jobs:
       - name: Show build log tail on failure
         if: failure()
         run: |
-          echo "===== build.log (tail 400) ====="
-          tail -n 400 build.log || true
+          echo "===== build.log (tail 800) ====="
+          tail -n 800 build.log || true
+          echo
+          echo "===== build.log 中的 ERROR 行 ====="
+          grep -n 'ERROR' build.log | tail -n 60 || true
+          echo
+          echo "===== 各外部库结果汇总 ====="
+          grep -E '^[a-z0-9_-]+: (ok|failed)$' build.log | tail -n 80 || true
+
+      # 失败时也把 build.log 留一份，便于定位问题（成功时的上传见下一步）
+      - name: Upload build log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: build-log-${{ github.run_number }}
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload artifacts
+        if: success()
         uses: actions/upload-artifact@v6
         with:
           name: ffmpeg-kit-arm64-v8a-${{ github.run_number }}
