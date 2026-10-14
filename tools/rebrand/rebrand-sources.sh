@@ -10,8 +10,9 @@
 #    3. JNI C 源码里的 JNI 导出符号 + FindClass 类路径改名
 #    4. gradle namespace / AAR 文件名改名
 #    5. android/jni/*.mk 里 prebuilt ffmpeg 库与包装库模块改名
-#    6. 给 scripts/android/ffmpeg.sh 注入 SLIBPREF 覆盖，让 ffmpeg 直接产出
-#       lib<前缀>_avcodec.so 等（这一步失败时由 rebrand-native.sh 兜底修正）
+#    6. 给 scripts/android/ffmpeg.sh 注入 SLIBPREF + LD_LIB 覆盖，让 ffmpeg 直接产出
+#       lib<前缀>_avcodec.so 等，且库间依赖链接用 -l<前缀>_<lib>
+#       （这一步失败时由 rebrand-native.sh 兜底修正）
 #    7. 修上游 meson cross file 的 pkg-config 键名 bug（rubberband 构建失败根因）
 #    8. 给 GPL 构建补 --enable-version3（OpenSSL >= 3.0.0 的硬性要求）
 #
@@ -161,9 +162,12 @@ grep -q "LOCAL_SHARED_LIBRARIES := ${PREFIX}_avfilter" "${JNI_MK}" || die "Andro
 log "android/jni/Android.mk 包装库模块名与依赖列表已替换"
 
 # ---------------------------------------------------------------------------
-# 8. 给 scripts/android/ffmpeg.sh 注入 SLIBPREF 覆盖
+# 8. 给 scripts/android/ffmpeg.sh 注入 SLIBPREF + LD_LIB 覆盖
 #    configure 之后、make 之前改 ffbuild/config.mak，让 ffmpeg 直接产出
 #    lib<前缀>_avcodec.so，并且 SONAME / DT_NEEDED 天然正确。
+#    ★ 必须同时改 LD_LIB：SLIBPREF 只管输出文件名，库之间的依赖链接走的是
+#      ffbuild/common.mak 的 FFEXTRALIBS := $(LDLIBS:%=$(LD_LIB))，即 -l<裸名>。
+#      只改 SLIBPREF 会以 "unable to find library -lavutil" 失败。
 # ---------------------------------------------------------------------------
 MARK_BEGIN="# >>> ffmpeg-kit-next rebrand: SLIBPREF >>>"
 MARK_END="# <<< ffmpeg-kit-next rebrand: SLIBPREF <<<"
@@ -194,12 +198,24 @@ if ! grep -qF "${MARK_BEGIN}" "${FFMPEG_SH}"; then
     cat > "${BLOCK_FILE}" <<'EOF'
 
 # >>> ffmpeg-kit-next rebrand: SLIBPREF >>>
+_REBRAND_CMAKE_MAK="${BASEDIR}"/src/ffmpeg/ffbuild/config.mak
 _REBRAND_SLIBPREF="lib@@PREFIX@@_"
-if grep -q '^SLIBPREF=' "${BASEDIR}"/src/ffmpeg/ffbuild/config.mak 2>/dev/null; then
-  ${SED_INLINE} "s|^SLIBPREF=.*|SLIBPREF=${_REBRAND_SLIBPREF}|" "${BASEDIR}"/src/ffmpeg/ffbuild/config.mak
-  echo -e "INFO: rebrand: ffmpeg SLIBPREF -> ${_REBRAND_SLIBPREF}\n" 1>>"${BASEDIR}"/build.log 2>&1
+_REBRAND_LD_LIB="-l@@PREFIX@@_%"
+# 这两项必须同时改，缺一不可：
+#   SLIBPREF  决定产出文件名      ->  libfkit_avutil.so
+#   LD_LIB    决定库间依赖的 -l 参数 ->  -lfkit_avutil
+# ffbuild/common.mak:211 是 FFEXTRALIBS := $(LDLIBS:%=$(LD_LIB))，
+# 即依赖链接用的是 -l<裸名>，与 SLIBPREF 完全无关。
+# 只改 SLIBPREF 会得到：ld.lld: error: unable to find library -lavutil
+# 两项任一改不动（config.mak 结构变了）就整体跳过，交给构建后的
+# rebrand-native.sh 用 patchelf 兜底改名。
+if grep -q '^SLIBPREF=' "${_REBRAND_CMAKE_MAK}" 2>/dev/null &&
+   grep -q '^LD_LIB=' "${_REBRAND_CMAKE_MAK}" 2>/dev/null; then
+  ${SED_INLINE} "s|^SLIBPREF=.*|SLIBPREF=${_REBRAND_SLIBPREF}|" "${_REBRAND_CMAKE_MAK}"
+  ${SED_INLINE} "s|^LD_LIB=.*|LD_LIB=${_REBRAND_LD_LIB}|" "${_REBRAND_CMAKE_MAK}"
+  echo -e "INFO: rebrand: ffmpeg SLIBPREF -> ${_REBRAND_SLIBPREF}, LD_LIB -> ${_REBRAND_LD_LIB}\n" 1>>"${BASEDIR}"/build.log 2>&1
 else
-  echo -e "INFO: rebrand: WARNING SLIBPREF not found in ffbuild/config.mak; post-build rename will fix it\n" 1>>"${BASEDIR}"/build.log 2>&1
+  echo -e "INFO: rebrand: WARNING SLIBPREF/LD_LIB not found in ffbuild/config.mak; post-build rename will fix it\n" 1>>"${BASEDIR}"/build.log 2>&1
 fi
 # <<< ffmpeg-kit-next rebrand: SLIBPREF <<<
 EOF

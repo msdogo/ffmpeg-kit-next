@@ -108,9 +108,12 @@ git push origin main
      ├ gradle：namespace + base.archivesName
      ├ android/jni/ffmpeg/Android.mk：7 个 prebuilt 库的 module/src 名
      ├ android/jni/Android.mk：包装库模块名 + LOCAL_SHARED_LIBRARIES
-     ├ 给 scripts/android/ffmpeg.sh 注入 SLIBPREF=lib<前缀>_
+     ├ 给 scripts/android/ffmpeg.sh 注入 SLIBPREF + LD_LIB 覆盖
      │  （configure 之后改 ffbuild/config.mak，让 ffmpeg 直接产出新名字，
      │    SONAME 和 DT_NEEDED 天然正确，不需要二次改 ELF）
+     │  ★ 必须成对改：SLIBPREF 决定输出文件名，LD_LIB 决定库间依赖的
+     │    -l 参数（`-l<裸名>`）。只改前者会以
+     │    `ld.lld: error: unable to find library -lavutil` 失败
      ├ 修上游 meson cross file 键名 bug：scripts/function-android.sh 里
      │  `pkg-config = ...` → `pkgconfig = ...`（否则 rubberband 构建必失败）
      └ 给 GPL 块补 `--enable-version3`
@@ -124,7 +127,7 @@ git push origin main
        --disable-lib-gnutls：ffmpeg 的 TLS 后端只能二选一，见第 7 节）
 
 3) rebrand-native.sh     校验 + 兜底
-     ├ 如果上一步 SLIBPREF 没生效，用 patchelf 重命名并修正
+     ├ 如果上一步 SLIBPREF / LD_LIB 注入没生效，用 patchelf 重命名并修正
      │  SONAME / 所有 DT_NEEDED，保证库之间还能互相找到
      └ 强校验：任何残留的旧库名都会让构建失败（不会给你一个坏包）
 
@@ -220,6 +223,7 @@ import com.fkit.ffmpegkit.FFmpegKit;
 | `Found Pkg-config: NO` + `meson.build:317:4: ERROR: C++ header 'samplerate.h' not found`，`rubberband: failed` | **上游 meson cross file 键名 bug**（`scripts/function-android.sh` 的 `create_mason_cross_file` 写了 `pkg-config = ...`，而 meson 认的键是 `pkgconfig`，且交叉编译时 `allow_default_for_cross=False` 不回退 PATH）。`rebrand-sources.sh` 第 9 步已就地修正为 `pkgconfig = 'pkg-config'`。详见下方说明 |
 | ffmpeg configure 阶段 `GnuTLS and OpenSSL must not be enabled at the same time.` | **`--enable-lib-all` 会同时打开 gnutls 和 openssl**，而 ffmpeg 的 TLS 后端只能二选一（configure:4851 直接 die）。必须加 **`--disable-lib-gnutls`**（保留 openssl）。**不能反过来关 openssl**：`scripts/android/srt.sh` 硬编码 `-DUSE_ENCLIB=openssl -DUSE_OPENSSL_PC=1`，没有 openssl 的 `.pc` 时 srt 构建会失败。gnutls 是叶子库（没有别的库依赖它），关掉无副作用。注意这个 die 发生在**所有 55 个外部库都编译完之后**，前面全绿也可能在这里挂 |
 | ffmpeg configure 阶段 `ERROR: OpenSSL >=3.0.0 requires --enable-version3`（或 `xxx is version3 and --enable-version3 is not specified`） | ffmpeg 要求 **GPL + OpenSSL ≥ 3.0.0 时必须带 `--enable-version3`**，而上游 `scripts/android/ffmpeg.sh` 只加了 `--enable-gpl`，从未加过 `--enable-version3`；本仓库编的是 `openssl-3.5.7`，必然踩中。`rebrand-sources.sh` 第 10 步已在 GPL 块里补上。详见下方说明 |
+| ffmpeg **编译链接**阶段 `ld.lld: error: unable to find library -lavutil`，紧接着 `make: *** [ffbuild/library.mak:153: libswscale/libfkit_swscale.so.10] Error 1` | **`SLIBPREF` 和 `LD_LIB` 必须成对改**。`SLIBPREF` 只决定**输出文件名**（`libfkit_avutil.so`），而库之间的依赖链接走 `ffbuild/common.mak:211` 的 `FFEXTRALIBS := $(LDLIBS:%=$(LD_LIB))`，用的是 `-l<裸名>`。`rebrand-sources.sh` 第 8 步现已同时注入这两项。详见下方说明 |
 | 链接阶段 OOM / `No space left on device` | 把 `BUILD_OPTS` 改成 `--jobs=2` 并加上 `--no-link-time-optimization`；同时确认 `Free disk space` 步骤没被删 |
 | 超过 6 小时被 kill | 同上（关掉 LTO 能省很多时间），或去掉几个用不到的大库（如 `--disable-lib-tesseract --disable-lib-svtav1`） |
 | `找不到 sdkmanager` | 把 workflow 里 `Set up Android SDK / NDK` 步骤替换成 `uses: android-actions/setup-android@v3` |
@@ -335,6 +339,54 @@ map "die_license_disabled version3" $EXTERNAL_LIBRARY_VERSION3_LIST $EXTERNAL_LI
 **许可影响**：`--enable-gpl` + `--enable-version3` ⇒ 许可声明变成
 `GPL version 3 or later`。本构建里 **rubberband v4 本身就是 GPL-3.0-or-later**，
 产物本来就已经是 GPLv3，所以这里只是把声明对齐，没有引入新的许可约束。
+
+### ffmpeg 内部库改名：`SLIBPREF` 与 `LD_LIB` 必须成对改
+
+改名方案是在 configure 之后往 `ffbuild/config.mak` 写 `SLIBPREF=lib<前缀>_`。
+但 **`SLIBPREF` 只管输出文件名，管不到库之间的依赖链接** —— 这是两套机制：
+
+```make
+# ffbuild/library.mak:96   —— 产出文件名（SLIBPREF 生效）
+$(SUBDIR)$(SLIBNAME_WITH_MAJOR): ...
+#   SLIBNAME_WITH_MAJOR = $(SLIBPREF)$(FULLNAME)$(SLIBSUF).$(LIBMAJOR)
+#                       = libfkit_avutil.so.61            ✓
+
+# ffbuild/common.mak:211   —— 库间依赖的链接参数（SLIBPREF 完全不参与）
+FFEXTRALIBS := $(LDLIBS:%=$(LD_LIB)) $(...) $(EXTRALIBS)
+#   LDLIBS = avutil avcodec ...     裸名，没有 lib 前缀、也没有前缀
+#   LD_LIB = '-l%'                  configure:4518
+#   ⇒ -lavutil -lavcodec ...        找的是 libavutil.so
+```
+
+所以只改 `SLIBPREF` 的后果是：`libavutil` 能编成 `libfkit_avutil.so.61`（成功），
+但 `libswscale` 链接时要 `-lavutil`，而 `libavutil/` 目录里没有 `libavutil.so`：
+
+```
+LDXX  libavutil/libfkit_avutil.so.61      ← 成功（它没有依赖）
+LDXX  libswscale/libfkit_swscale.so.10
+ld.lld: error: unable to find library -lavutil
+make: *** [ffbuild/library.mak:153: libswscale/libfkit_swscale.so.10] Error 1
+```
+
+**修法**：同时改 `LD_LIB='-l<前缀>_%'`。`$(LDLIBS:%=$(LD_LIB))` 是 make 的替换引用，
+替换串里的 `%` 会被词干替换，所以 `LD_LIB=-lfkit_%` 把 `avutil` 映射成 `-lfkit_avutil`；
+而 `common.mak:50` 生成的 `-Llibavutil` 仍然指向正确子目录，
+`libavutil/libfkit_avutil.so` 则由 library.mak 的软链规则自动创建。
+
+改动面已逐项核对，很干净：
+
+| 关注点 | 结论 |
+| --- | --- |
+| `LD_LIB` 的全部消费者 | 只有 `common.mak:211` 和 `library.mak:66`（后者属 `$(TOOLS)`，本构建开了 `--disable-programs`，走不到） |
+| `LDLIBS` 的内容 | `$(FFLIBS:%=%$(BUILDSUF))`，就是 ffmpeg 自家裸库名；外部库走 `$(EXTRALIBS)`，不受影响 |
+| `DEP_LIBS`（依赖文件路径） | 走 `PATH_LIBNAME` → `$(S)LIBNAME`，已被 `SLIBPREF` 覆盖成 `libavutil/libfkit_avutil.so`，与 `-lfkit_avutil` 一致 |
+| `make install` 产物 | `SLIB_INSTALL_NAME` / `SLIB_INSTALL_LINKS` 都基于 `SLIBNAME*`，装出来就是 `libfkit_avcodec.so`（外加 `.so.61` 软链） |
+| `libav*.pc` 内容 | `pkgconfig_generate.sh` 不读 `LD_LIB`；而且 Android 链路上**没有任何消费者**（包装库由 ndk-build + `Android.mk` 直接引用 prebuilt `.so`），纯装饰 |
+| 改动生效时机 | ffmpeg 是**单次非递归 make**，top Makefile 先 include `config.mak` 再 include `common.mak`，所以在 config.mak 末尾追加赋值必然盖住前面的 `LD_LIB=-l%` |
+
+脚本里的实现是**成对且原子**的：只有 `^SLIBPREF=` 与 `^LD_LIB=` 在 config.mak 里
+都能找到才动手，任一缺失就整体跳过并在 `build.log` 打 `WARNING`，
+交给构建后的 `rebrand-native.sh` 用 patchelf 兜底 —— 不会产出半改状态。
 
 ### 无 CI，本地 / 其他机器上编译
 
