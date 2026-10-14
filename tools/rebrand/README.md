@@ -149,6 +149,10 @@ git push origin main
 
 另外 `build.log` 也会一起上传（构建失败时先看它）。
 
+CI 上还会单独上传一个 **`native-libs-arm64-v8a-<run_number>`** 产物（内容是 `android/libs/`，
+即 ndk-build 出来的 9 个 `.so`，也是 AAR 里 `jniLibs` 的来源）。它在「改名 + 校验」之后、
+**无条件上传**，所以哪怕后面的 gradle 打包环节出问题，编译成果也保得住，不必再烧一整轮。
+
 ---
 
 ## 5. 在 Android 工程里接入
@@ -224,6 +228,7 @@ import com.fkit.ffmpegkit.FFmpegKit;
 | ffmpeg configure 阶段 `GnuTLS and OpenSSL must not be enabled at the same time.` | **`--enable-lib-all` 会同时打开 gnutls 和 openssl**，而 ffmpeg 的 TLS 后端只能二选一（configure:4851 直接 die）。必须加 **`--disable-lib-gnutls`**（保留 openssl）。**不能反过来关 openssl**：`scripts/android/srt.sh` 硬编码 `-DUSE_ENCLIB=openssl -DUSE_OPENSSL_PC=1`，没有 openssl 的 `.pc` 时 srt 构建会失败。gnutls 是叶子库（没有别的库依赖它），关掉无副作用。注意这个 die 发生在**所有 55 个外部库都编译完之后**，前面全绿也可能在这里挂 |
 | ffmpeg configure 阶段 `ERROR: OpenSSL >=3.0.0 requires --enable-version3`（或 `xxx is version3 and --enable-version3 is not specified`） | ffmpeg 要求 **GPL + OpenSSL ≥ 3.0.0 时必须带 `--enable-version3`**，而上游 `scripts/android/ffmpeg.sh` 只加了 `--enable-gpl`，从未加过 `--enable-version3`；本仓库编的是 `openssl-3.5.7`，必然踩中。`rebrand-sources.sh` 第 10 步已在 GPL 块里补上。详见下方说明 |
 | ffmpeg **编译链接**阶段 `ld.lld: error: unable to find library -lavutil`，紧接着 `make: *** [ffbuild/library.mak:153: libswscale/libfkit_swscale.so.10] Error 1` | **`SLIBPREF` 和 `LD_LIB` 必须成对改**。`SLIBPREF` 只决定**输出文件名**（`libfkit_avutil.so`），而库之间的依赖链接走 `ffbuild/common.mak:211` 的 `FFEXTRALIBS := $(LDLIBS:%=$(LD_LIB))`，用的是 `-l<裸名>`。`rebrand-sources.sh` 第 8 步现已同时注入这两项。详见下方说明 |
+| 打 AAR 阶段 `Failed to apply plugin 'com.android.internal.library'` + `Android Gradle plugin requires Java 17 to run. You are currently using Java 11.` | **runner 默认 JDK 是 11，而 `android/build.gradle` 用的 AGP 8.13.2 硬性要求 17+**。早先 workflow 靠手写 `${JAVA_HOME_17_X86_64}` 探测，但这个变量名在 runner 镜像里不保证存在；一旦取空，`if` 分支静默跳过、步骤仍显示 success，直到**最后一步**才以「Java 11」暴露，代价是白跑整轮编译。现已改为 `actions/setup-java@v6`（temurin / 17）+ `Verify JDK >= 17` 硬校验，`package-aar.sh` 里也自带一道断言。注意这步失败时**前面 9 步全绿**（55 个外部库 + ffmpeg 都已编译完成），所以此时直接重跑很亏 |
 | 链接阶段 OOM / `No space left on device` | 把 `BUILD_OPTS` 改成 `--jobs=2` 并加上 `--no-link-time-optimization`；同时确认 `Free disk space` 步骤没被删 |
 | 超过 6 小时被 kill | 同上（关掉 LTO 能省很多时间），或去掉几个用不到的大库（如 `--disable-lib-tesseract --disable-lib-svtav1`） |
 | `找不到 sdkmanager` | 把 workflow 里 `Set up Android SDK / NDK` 步骤替换成 `uses: android-actions/setup-android@v3` |

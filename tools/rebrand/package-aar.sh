@@ -51,6 +51,20 @@ cd "${ROOT}/android"
 
 export JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS:-} -Duser.language=en -Duser.country=US"
 
+# AGP 8.13.2 硬性要求 JDK 17+。JAVA_HOME 指向低版本时，gradle 会在工程 evaluate
+# 阶段才失败（"Android Gradle plugin requires Java 17 to run. You are currently
+# using Java 11."），浪费一整轮编译。提前拦截并给出可操作的指引。
+_JAVA_BIN="java"
+if [ -n "${JAVA_HOME:-}" ] && [ -x "${JAVA_HOME}/bin/java" ]; then
+  _JAVA_BIN="${JAVA_HOME}/bin/java"
+fi
+_JAVA_VER="$("${_JAVA_BIN}" -version 2>&1 | head -n 1 || true)"
+_JAVA_MAJ="$(printf '%s' "${_JAVA_VER}" | sed -n 's/.*version "\([0-9][0-9]*\).*/\1/p')"
+log "JDK: ${_JAVA_VER}  (JAVA_HOME=${JAVA_HOME:-未设置})"
+if [ -z "${_JAVA_MAJ}" ] || [ "${_JAVA_MAJ}" -lt 17 ]; then
+  die "gradle 需要 JDK 17 或更高（AGP 8.13.2），当前为：${_JAVA_VER}。请把 JAVA_HOME 指向 JDK 17+。"
+fi
+
 log "执行 gradlew assembleRelease ..."
 bash ./gradlew --no-daemon ffmpeg-kit-next-android-lib:clean ffmpeg-kit-next-android-lib:assembleRelease
 

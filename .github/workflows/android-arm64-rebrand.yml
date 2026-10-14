@@ -179,14 +179,33 @@ jobs:
           # 明确打印 asn1Parser 路径，方便日后排查 gnutls 相关构建问题
           echo "asn1Parser 位置: $(command -v asn1Parser)"
 
-      - name: Select JDK 17
+      # ★ JDK 必须 >= 17。android/build.gradle 用的是 AGP 8.13.2，低于 17 会在
+      #   工程 evaluate 阶段直接失败：
+      #     Failed to apply plugin 'com.android.internal.library'.
+      #       > Android Gradle plugin requires Java 17 to run. You are currently using Java 11.
+      #   早先这里写的是 ${JAVA_HOME_17_X86_64} 手写探测，但 runner 镜像并不保证
+      #   存在这个变量名（预置的可能是 JAVA_HOME_17_X64 之类）；一旦取空，if 分支
+      #   静默跳过，本步骤照样显示 success，直到最后打 AAR 那步才以「Java 11」
+      #   暴露出来 —— 代价是白跑 30 分钟编译（实测踩过）。
+      #   改用官方 action 并提供 JDK，再由下一步做硬校验，彻底杜绝静默失败。
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Verify JDK >= 17
         run: |
           set -euo pipefail
-          if [ -n "${JAVA_HOME_17_X86_64:-}" ]; then
-            echo "JAVA_HOME=${JAVA_HOME_17_X86_64}" >> "$GITHUB_ENV"
-            echo "${JAVA_HOME_17_X86_64}/bin" >> "$GITHUB_PATH"
+          V="$(java -version 2>&1 | head -n 1 || true)"
+          echo "java: ${V}"
+          echo "JAVA_HOME=${JAVA_HOME:-（未设置）}"
+          MAJ="$(printf '%s' "${V}" | sed -n 's/.*version "\([0-9][0-9]*\).*/\1/p')"
+          if [ -z "${MAJ}" ] || [ "${MAJ}" -lt 17 ]; then
+            echo "::error::JDK 版本不足 17（${V}）。AGP 8.13.2 要求 Java 17+；若在此放过，只会在最后的 AAR 打包步骤才失败。"
+            exit 1
           fi
-          java -version
+          echo "JDK 校验通过：主版本 ${MAJ}"
 
       - name: Set up Android SDK / NDK r27d
         run: |
@@ -241,6 +260,19 @@ jobs:
 
       - name: Rebrand native libraries (.so) and verify
         run: bash tools/rebrand/rebrand-native.sh
+
+      # 编译成果单独留一份（无论后面成功失败）。
+      # ndk-build 的产物落在 android/libs/<abi>/，正是 AAR 的 jniLibs 来源，
+      # 所以万一 gradle 打包环节出问题，也不用重新烧 30 分钟编译。
+      - name: Upload native libraries (always)
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: native-libs-arm64-v8a-${{ github.run_number }}
+          path: |
+            android/libs/**
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Package AAR + local Maven repository
         run: bash tools/rebrand/package-aar.sh
