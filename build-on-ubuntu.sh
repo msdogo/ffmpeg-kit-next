@@ -151,18 +151,31 @@ auto_jobs() {
   printf '%s' "${j}"
 }
 
-# 从 $JAVA_HOME/release 读 JDK 主版本（JVM 规范文件，不受 JAVA_TOOL_OPTIONS / locale 影响）
+# 读取某个 JDK 安装目录的主版本（如 /usr/lib/jvm/java-17-openjdk-amd64）。
+# 优先 $dir/release —— JVM 规范文件，不受 JAVA_TOOL_OPTIONS / locale 影响；
+# 注意 Debian/Ubuntu 的 openjdk-17-jdk-headless 自己的文件清单里**没有** release
+# （由依赖包 openjdk-17-jre-headless 提供），布局一旦不同就会误判成「不是 JDK」。
+# 所以读不到 release 时回落解析 bin/java -version，并用引号锚定 version token，
+# 以天然跳过 JVM 先打印的 "Picked up JAVA_TOOL_OPTIONS:" 行。
 java_major_of() {
-  local home="$1"
-  [ -n "${home}" ] && [ -r "${home}/release" ] || return 1
-  sed -n 's/^JAVA_VERSION="\([0-9][0-9]*\).*/\1/p' "${home}/release" | head -n 1
+  local d="${1%/}" maj=""
+  if [ -n "${d}" ] && [ -r "${d}/release" ]; then
+    maj="$(sed -n 's/^JAVA_VERSION="\([0-9][0-9]*\).*/\1/p' "${d}/release" | head -n 1)"
+  fi
+  if [ -z "${maj}" ] && [ -n "${d}" ] && [ -x "${d}/bin/java" ]; then
+    maj="$("${d}/bin/java" -version 2>&1 | tr -d '\r' \
+          | sed -n 's/.*version "\([0-9][0-9]*\).*/\1/p' | head -n 1 || true)"
+  fi
+  [ -n "${maj}" ] || return 1
+  printf '%s' "${maj}"
 }
 
-# 在 /usr/lib/jvm 下挑一个 Gradle 8.14.5 能用的 JDK（17~24），优先高版本
+# 在 /usr/lib/jvm 下挑一个 Gradle 8.14.5 能用的 JDK（17~24），优先高版本。
+# 绝不能选 25：Ubuntu 26.04 LTS 默认就是 JDK 25，而 Gradle 8.14.5 支持上限是 24。
 pick_system_jdk() {
   local d maj best="" bestmaj=0
   for d in /usr/lib/jvm/*/; do
-    [ -r "${d}release" ] || continue
+    [ -r "${d}release" ] || [ -x "${d}bin/java" ] || continue
     maj="$(java_major_of "${d%/}" || true)"
     [ -n "${maj}" ] || continue
     [ "${maj}" -ge 17 ] && [ "${maj}" -le 24 ] || continue
@@ -293,12 +306,22 @@ do_deps() {
   local JH
   JH="$(pick_system_jdk || true)"
   if [ -z "${JH}" ]; then
-    c_info "没找到合适的 JDK（需要 17~24），尝试安装 openjdk-17-jdk-headless ..."
+    # 优先 17（与 AGP 8.13.2 兼容性最好），再退到 21/24/23。
+    # 注意不要装 25+：Gradle 8.14.5 官方支持上限是 24（Ubuntu 26.04 的默认
+    # JDK 就是 25，所以这里必须显式挑低版本，不能直接用系统默认 java）。
+    c_info "没找到可用的 JDK 17~24，尝试从 apt 安装 ..."
     local JDK_PKG=""
-    for cand in openjdk-17-jdk-headless openjdk-21-jdk-headless; do
+    for cand in openjdk-17-jdk-headless openjdk-21-jdk-headless \
+                openjdk-24-jdk-headless openjdk-23-jdk-headless; do
       if apt-cache show "${cand}" >/dev/null 2>&1; then JDK_PKG="${cand}"; break; fi
     done
-    [ -n "${JDK_PKG}" ] || c_die "apt 源里没有 openjdk-17/21，请手动安装 JDK 17~24 后重试"
+    if [ -z "${JDK_PKG}" ]; then
+      c_die "apt 源里找不到 JDK 17/21/24/23。请手动装一个 17~24 的 JDK 后重试，例如：
+        sudo apt-get install -y openjdk-17-jdk-headless
+      或（源里确实没有时）用 SDKMAN：
+        curl -s https://get.sdkman.io | bash && source ~/.sdkman/bin/sdkman-init.sh && sdk install java 17.0.13-tem
+      装好后确认 /usr/lib/jvm/ 下存在 17~24 的 JDK（有 release 或 bin/java 均可识别）"
+    fi
     sudo apt-get install -y --no-install-recommends "${JDK_PKG}"
     JH="$(pick_system_jdk || true)"
   fi
