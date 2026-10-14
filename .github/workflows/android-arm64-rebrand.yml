@@ -1,0 +1,230 @@
+# =============================================================================
+#  用 GitHub Actions 编译「改名版」FFmpegKitNext for Android
+#
+#  - 只编译 arm64-v8a（arm v8）
+#  - 启用全部外部库（--enable-lib-all --enable-gpl）
+#  - 把 ffmpeg 的 libavcodec.so / libavformat.so … 和 ffmpeg-kit 包装库整体改名，
+#    避免与 DJI SDK 自带的 ffmpeg 动态库在同一个 APK 里重名冲突
+#  - 产出：release AAR + 本地 Maven 仓库 + 单独的 .so 包
+#
+#  用法：把这个文件和 tools/rebrand/ 一起提交到你的 fork，
+#        在 Actions 页面手动触发 workflow 即可。
+# =============================================================================
+
+name: Android arm64-v8a (rebranded)
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_opts:
+        description: "覆盖默认构建参数（留空则用 env.BUILD_OPTS）"
+        required: false
+        type: string
+        default: ""
+  push:
+    branches: [main, master]
+    paths:
+      - ".github/workflows/android-arm64-rebrand.yml"
+      - "tools/rebrand/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ffmpeg-android-arm64-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # -------------------------------------------------------------------------
+  # 工具链版本（与上游 flake 的 android-r27d profile 对齐）
+  # -------------------------------------------------------------------------
+  NDK_VERSION: "27.3.13750724"
+  PLATFORM_VERSION: "34"
+  BUILD_TOOLS_VERSION: "35.0.0"
+  CMAKE_VERSION: "3.22.1"
+
+  # -------------------------------------------------------------------------
+  # 改名配置（★ 通常只需要改这一段 ★）
+  # -------------------------------------------------------------------------
+  # 原生库前缀：lib<前缀>_avcodec.so / lib<前缀>_avformat.so / … / lib<前缀>.so
+  REBRAND_NATIVE_PREFIX: "fkit"
+  # Java/Kotlin 包名（会同步修改 JNI 符号，工程里的 import 也要跟着改）
+  REBRAND_JAVA_PACKAGE: "com.fkit.ffmpegkit"
+  # Maven 坐标
+  REBRAND_GROUP_ID: "com.fkit"
+  REBRAND_ARTIFACT_ID: "ffmpeg-kit"
+  # AAR 文件名：<值>-release.aar
+  REBRAND_ARCHIVE_NAME: "ffmpeg-kit"
+  # 1 = 从 AAR 里删掉 libc++_shared.so（工程中已有同名库时用）
+  REBRAND_STRIP_LIBCXX_SHARED: "0"
+  # ABI / API
+  REBRAND_API_LEVEL: "24"
+
+  # -------------------------------------------------------------------------
+  # 构建参数
+  #   --arch=arm64-v8a  只编 arm v8
+  #   --enable-lib-all  打开全部外部库
+  #   --enable-gpl      打开 GPL 库（x264/x265/xvidcore/rubberband/libvidstab）★★ 见 README 许可说明
+  #   --no-archive      不在构建脚本里打 AAR，改名之后再自己打
+  #
+  #   ★ jobs 说明：标准 ubuntu runner 只有 2 核 / 7GB 内存 / ~14GB 磁盘，
+  #     所以这里固定 --jobs=2（匹配核心数，避免 LTO 链接阶段 OOM）。
+  #     想更快可以调高，但内存不够时链接会直接挂。
+  #   ★ 如果仍然 OOM 或磁盘不足，追加：--no-link-time-optimization
+  # -------------------------------------------------------------------------
+  BUILD_OPTS: "--arch=arm64-v8a --enable-lib-all --enable-gpl --api-level=24 --no-archive --jobs=2"
+
+jobs:
+  build:
+    name: build arm64-v8a
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout
+        # v6 要求 runner >= 2.327.1（Node 24），GitHub 托管 runner 已满足
+        uses: actions/checkout@v6
+        with:
+          # android.sh 用 `git describe --tags --always` 生成版本号，必须带 tag
+          fetch-depth: 0
+
+      # ---------------------------------------------------------------------
+      # 环境准备
+      # ---------------------------------------------------------------------
+      - name: Free disk space
+        run: |
+          set -x
+          df -h /
+          sudo rm -rf /usr/local/lib/android/sdk/ndk || true
+          sudo rm -rf /usr/local/lib/android/sdk/system-images || true
+          sudo rm -rf /usr/local/lib/android/sdk/emulator || true
+          sudo rm -rf /usr/local/lib/android/sdk/sources || true
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/share/swift || true
+          sudo docker image prune -af || true
+          df -h /
+
+      - name: Install host build tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential gcc g++ make cmake ninja-build meson \
+            autoconf automake libtool libtool-bin autopoint m4 \
+            pkg-config bison flex gperf ragel autogen \
+            nasm yasm \
+            gettext texinfo groff gawk \
+            doxygen gtk-doc-tools \
+            python3 python3-pip perl ruby \
+            rsync zip unzip wget curl gnupg ca-certificates file patch which \
+            libtasn1-6-dev zlib1g-dev patchelf
+
+      - name: Select JDK 17
+        run: |
+          set -euo pipefail
+          if [ -n "${JAVA_HOME_17_X86_64:-}" ]; then
+            echo "JAVA_HOME=${JAVA_HOME_17_X86_64}" >> "$GITHUB_ENV"
+            echo "${JAVA_HOME_17_X86_64}/bin" >> "$GITHUB_PATH"
+          fi
+          java -version
+
+      - name: Set up Android SDK / NDK r27d
+        run: |
+          set -euo pipefail
+
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "使用 SDK 目录: $SDK"
+
+          SDKMGR="$(ls -1 "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -1 || true)"
+          if [ -z "$SDKMGR" ] || [ ! -x "$SDKMGR" ]; then
+            echo "::error::在 $SDK 下找不到 sdkmanager。请把本步骤替换为：uses: android-actions/setup-android@v3"
+            exit 1
+          fi
+          echo "使用 sdkmanager: $SDKMGR"
+
+          echo "$(dirname "$SDKMGR")" >> "$GITHUB_PATH"
+
+          yes | "$SDKMGR" --sdk_root="$SDK" --licenses > /dev/null || true
+          "$SDKMGR" --sdk_root="$SDK" --install \
+            "platform-tools" \
+            "platforms;android-${PLATFORM_VERSION}" \
+            "build-tools;${BUILD_TOOLS_VERSION}" \
+            "cmake;${CMAKE_VERSION}" \
+            "ndk;${NDK_VERSION}"
+
+          {
+            echo "ANDROID_SDK_ROOT=$SDK"
+            echo "ANDROID_HOME=$SDK"
+            echo "ANDROID_NDK_ROOT=$SDK/ndk/${NDK_VERSION}"
+          } >> "$GITHUB_ENV"
+          echo "$SDK/platform-tools" >> "$GITHUB_PATH"
+
+          echo "NDK 版本: $(sed -n 's/^Pkg.Revision[[:space:]]*=[[:space:]]*//p' "$SDK/ndk/${NDK_VERSION}/source.properties")"
+          df -h /
+
+      # ---------------------------------------------------------------------
+      # 改名 + 构建
+      # ---------------------------------------------------------------------
+      - name: Apply rebrand to sources
+        # 用 bash 显式调用：避免文件可执行位在 Windows 上丢失导致 Permission denied
+        run: bash tools/rebrand/rebrand-sources.sh
+
+      - name: Build FFmpegKit (arm64-v8a, all external libraries)
+        env:
+          EXTRA_OPTS: ${{ inputs.build_opts }}
+        run: |
+          set -euo pipefail
+          OPTS="${EXTRA_OPTS:-${BUILD_OPTS}}"
+          echo "构建参数: $OPTS"
+          # shellcheck disable=SC2086
+          bash ./android.sh $OPTS --package-name="${REBRAND_JAVA_PACKAGE}"
+
+      - name: Rebrand native libraries (.so) and verify
+        run: bash tools/rebrand/rebrand-native.sh
+
+      - name: Package AAR + local Maven repository
+        run: bash tools/rebrand/package-aar.sh
+
+      # ---------------------------------------------------------------------
+      # 结果
+      # ---------------------------------------------------------------------
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## FFmpegKitNext Android arm64-v8a (rebranded)"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| FFmpegKit 版本 | $(sed -n 's/.*#define FFMPEG_KIT_VERSION "$[^"]*$".*/\1/p' android/ffmpeg-kit-next-android-lib/src/main/cpp/ffmpegkit.h | head -1) |"
+            echo "| ABI | arm64-v8a |"
+            echo "| 动态库前缀 | lib${REBRAND_NATIVE_PREFIX}* |"
+            echo "| Java 包名 | ${REBRAND_JAVA_PACKAGE} |"
+            echo "| Maven 坐标 | ${REBRAND_GROUP_ID}:${REBRAND_ARTIFACT_ID}:<version> |"
+            echo "| 构建参数 | \`${BUILD_OPTS}\` |"
+            echo ""
+            echo "### 产物"
+            echo '```'
+            ls -lh out 2>/dev/null || echo "(无产物)"
+            echo '```'
+            echo ""
+            echo "### AAR 内动态库"
+            echo '```'
+            unzip -l out/*.aar 2>/dev/null | awk '/\.so$/ {print $NF}' || echo "(无)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show build log tail on failure
+        if: failure()
+        run: |
+          echo "===== build.log (tail 400) ====="
+          tail -n 400 build.log || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: ffmpeg-kit-arm64-v8a-${{ github.run_number }}
+          path: |
+            out/**
+            build.log
+          if-no-files-found: error
+          retention-days: 30
