@@ -1,0 +1,6 @@
+# 保证 shell 脚本和 makefile 在任何平台上进出仓库都保持 LF，
+# 否则在 Windows 上 checkout/commit 可能写入 CRLF，导致 CI 里 bash 报
+# "bad interpreter" / "$'\r': command not found"
+*.sh   text eol=lf
+*.env  text eol=lf
+*.mk   text eol=lf
