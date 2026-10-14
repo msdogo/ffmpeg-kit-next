@@ -229,6 +229,8 @@ import com.fkit.ffmpegkit.FFmpegKit;
 | ffmpeg configure 阶段 `ERROR: OpenSSL >=3.0.0 requires --enable-version3`（或 `xxx is version3 and --enable-version3 is not specified`） | ffmpeg 要求 **GPL + OpenSSL ≥ 3.0.0 时必须带 `--enable-version3`**，而上游 `scripts/android/ffmpeg.sh` 只加了 `--enable-gpl`，从未加过 `--enable-version3`；本仓库编的是 `openssl-3.5.7`，必然踩中。`rebrand-sources.sh` 第 10 步已在 GPL 块里补上。详见下方说明 |
 | ffmpeg **编译链接**阶段 `ld.lld: error: unable to find library -lavutil`，紧接着 `make: *** [ffbuild/library.mak:153: libswscale/libfkit_swscale.so.10] Error 1` | **`SLIBPREF` 和 `LD_LIB` 必须成对改**。`SLIBPREF` 只决定**输出文件名**（`libfkit_avutil.so`），而库之间的依赖链接走 `ffbuild/common.mak:211` 的 `FFEXTRALIBS := $(LDLIBS:%=$(LD_LIB))`，用的是 `-l<裸名>`。`rebrand-sources.sh` 第 8 步现已同时注入这两项。详见下方说明 |
 | 打 AAR 阶段 `Failed to apply plugin 'com.android.internal.library'` + `Android Gradle plugin requires Java 17 to run. You are currently using Java 11.` | **runner 默认 JDK 是 11，而 `android/build.gradle` 用的 AGP 8.13.2 硬性要求 17+**。早先 workflow 靠手写 `${JAVA_HOME_17_X86_64}` 探测，但这个变量名在 runner 镜像里不保证存在；一旦取空，`if` 分支静默跳过、步骤仍显示 success，直到**最后一步**才以「Java 11」暴露，代价是白跑整轮编译。现已改为 `actions/setup-java@v6`（temurin / 17）+ `Verify JDK >= 17` 硬校验，`package-aar.sh` 里也自带一道断言。注意这步失败时**前面 9 步全绿**（55 个外部库 + ffmpeg 都已编译完成），所以此时直接重跑很亏 |
+| 打 AAR 阶段 `[package-aar] ERROR: gradle 需要 JDK 17 或更高（AGP 8.13.2），当前为：Picked up JAVA_TOOL_OPTIONS: ...` | **版本探测被脚本自己设的环境变量污染**。`package-aar.sh` 为了强制 gradle 输出英文会 `export JAVA_TOOL_OPTIONS="... -Duser.language=en -Duser.country=US"`，而 JVM 每次启动都会先往 **stderr** 吐一行 `Picked up JAVA_TOOL_OPTIONS: ...`。原来用 `java -version 2>&1 \| head -n 1` 取首行当版本串，取到的正是这行垃圾 → 解析不出主版本 → 误判「JDK 不足 17」直接 die。**诡异之处：同一次 run 里 `Verify JDK >= 17` 步骤是绿的**（该步骤没设 `JAVA_TOOL_OPTIONS`，首行是真版本行），于是表现为「校验通过、打包却挂」。现已改为**优先读 `$JAVA_HOME/release`**（JVM 规范文件，不受环境变量与 locale 影响），仅在读不到时才回落解析 `java -version`，且用 `version "…"` 引号锚定以天然跳过 `Picked up` 行。`package-aar.sh` 与 workflow 两处写法已统一 |
+| 打 AAR 阶段 dokka 相关失败（`org.jetbrains.dokka` 插件加载异常 / Kotlin 版本不兼容） | 上游模块 `build.gradle` 无条件 `apply plugin: 'org.jetbrains.dokka'` 并注册 `dokkaJavadocJar`，把 **Kotlin ↔ Dokka 版本矩阵**耦了进来（上游组合是 Kotlin 2.0.21 + Dokka 1.9.20）。我们只要 AAR、不需要 javadoc jar，`rebrand-sources.sh` **第 5b 步**会移除该插件行与整个任务块（awk 按花括号配平删除，幂等；找不到 dokka 痕迹就整段跳过） |
 | 链接阶段 OOM / `No space left on device` | 把 `BUILD_OPTS` 改成 `--jobs=2` 并加上 `--no-link-time-optimization`；同时确认 `Free disk space` 步骤没被删 |
 | 超过 6 小时被 kill | 同上（关掉 LTO 能省很多时间），或去掉几个用不到的大库（如 `--disable-lib-tesseract --disable-lib-svtav1`） |
 | `找不到 sdkmanager` | 把 workflow 里 `Set up Android SDK / NDK` 步骤替换成 `uses: android-actions/setup-android@v3` |
@@ -422,6 +424,20 @@ bash tools/rebrand/package-aar.sh
   `FindClass` 类路径、`consumer-rules.pro`、gradle、两个 `Android.mk`、
   `ffmpeg.sh` 注入后的语法（`bash -n` 通过）、重复执行幂等；
   且已确认**只改了头文件引用以外的必要位置**（`#include "libavutil/log.h"` 这类 ffmpeg 头目录名不动）。
+- ✅ **编译段已在 CI 实证通过**：连续两轮 run 里
+  `Build FFmpegKit (arm64-v8a, all external libraries)` 与
+  `Rebrand native libraries (.so) and verify` 都是绿的 —— 55 个外部库全部编成、ffmpeg 自身链接成功、
+  `android/libs/arm64-v8a/` 下 9 个 `libfkit_*.so` 命名与互相依赖一致
+  （`build.log` 里可见 `INFO: rebrand: ffmpeg SLIBPREF -> libfkit_, LD_LIB -> -lfkit_%`）。
+- ✅ **JDK 探测逻辑已实测**：把这段代码抽出来配假 JDK 目录跑了 8 个场景
+  （有/无 `release` 文件、`Picked up JAVA_TOOL_OPTIONS` 污染、低版本拒绝、
+  `JAVA_HOME` 缺失而回退 PATH、无 minor 的 `"17"`），结果全部符合预期；
+  `package-aar.sh` 与 workflow 两处写法已统一。
+- ⚠️ **`Package AAR + local Maven repository` 这一步尚未成功跑通**。上一轮它被上面那条
+  JDK 误判挡在 gradle 启动之前，也就是说 **JDK 17 下 gradle 打包本身还没被真正验证过**。
+  已提前排除的风险：模块 `build.gradle` 用 `jniLibs.srcDirs = ["../libs"]` 直接吃预编译 `.so`
+  （**没有 externalNativeBuild**，不会重跑 NDK/CMake）、依赖只有 `smart-exception-java`
+  （Maven Central 可得）、dokka 已摘除。若此处仍失败，先看 `--stacktrace` 打出的完整堆栈。
 - ⚠️ **完整 AAR 需要在 CI 里编译**（Linux + Android NDK 才能交叉编译 Android 目标，Windows 本机无法完成）。
   `rebrand-native.sh` 里的 patchelf 兜底路径与 `package-aar.sh` 只能在真实构建环境里跑到，
   所以第一次跑完务必看一眼 job 里 `Rebrand native libraries (.so) and verify` 这一步的输出。

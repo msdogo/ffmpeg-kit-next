@@ -197,12 +197,25 @@ jobs:
       - name: Verify JDK >= 17
         run: |
           set -euo pipefail
-          V="$(java -version 2>&1 | head -n 1 || true)"
-          echo "java: ${V}"
+          # 优先读 $JAVA_HOME/release（JVM 规范文件，不受 JAVA_TOOL_OPTIONS / locale 影响）；
+          # 回落解析 `java -version` 时用引号锚定 version token。绝不能取第一行——只要
+          # JAVA_TOOL_OPTIONS 被设置过，首行就是 `Picked up JAVA_TOOL_OPTIONS: ...`。
+          MAJ=""
+          VER=""
+          if [ -n "${JAVA_HOME:-}" ] && [ -r "${JAVA_HOME}/release" ]; then
+            MAJ="$(sed -n 's/^JAVA_VERSION="\([0-9][0-9]*\).*/\1/p' "${JAVA_HOME}/release" | head -n 1)"
+            if [ -n "${MAJ}" ]; then
+              VER="$(sed -n 's/^JAVA_VERSION="\([^"]*\)".*/\1/p' "${JAVA_HOME}/release" | head -n 1) (取自 JAVA_HOME/release)"
+            fi
+          fi
+          if [ -z "${MAJ}" ]; then
+            VER="$(java -version 2>&1 | tr -d '\r' | sed -n 's/.*\(version "[^"]*"\).*/\1/p' | head -n 1 || true)"
+            MAJ="$(printf '%s' "${VER}" | sed -n 's/.*version "\([0-9][0-9]*\).*/\1/p')"
+          fi
+          echo "java: ${VER:-无法探测}"
           echo "JAVA_HOME=${JAVA_HOME:-（未设置）}"
-          MAJ="$(printf '%s' "${V}" | sed -n 's/.*version "\([0-9][0-9]*\).*/\1/p')"
           if [ -z "${MAJ}" ] || [ "${MAJ}" -lt 17 ]; then
-            echo "::error::JDK 版本不足 17（${V}）。AGP 8.13.2 要求 Java 17+；若在此放过，只会在最后的 AAR 打包步骤才失败。"
+            echo "::error::JDK 版本不足 17（${VER:-无法探测}）。AGP 8.13.2 要求 Java 17+；若在此放过，只会在最后的 AAR 打包步骤才失败。"
             exit 1
           fi
           echo "JDK 校验通过：主版本 ${MAJ}"

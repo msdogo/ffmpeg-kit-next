@@ -129,6 +129,44 @@ sed -i -E "s|^([[:space:]]*namespace[[:space:]]*=[[:space:]]*).*$|\1'${NEW_PKG}'
 sed -i -E "s|^([[:space:]]*archivesName[[:space:]]*=[[:space:]]*).*$|\1\"${REBRAND_ARCHIVE_NAME}\"|" "${GRADLE_FILE}"
 log "gradle namespace=${NEW_PKG}, archivesName=${REBRAND_ARCHIVE_NAME}"
 
+# 5b. 移除 dokka（javadoc）插件与 dokkaJavadocJar 任务
+#     产物是给 App 集成用的 AAR，不需要 javadoc jar；而 dokka 会把
+#     Kotlin ↔ Dokka 的版本矩阵耦进来（上游是 Kotlin 2.0.21 + Dokka 1.9.20），
+#     属于纯额外的故障点，去掉可少一类 gradle 配置期失败。
+#     幂等：文件里已经没有 dokka 痕迹时整段跳过，不做任何写入。
+if grep -qE "org\.jetbrains\.dokka|dokkaJavadoc" "${GRADLE_FILE}"; then
+  _nodokka_tmp="$(mktemp)"
+  # 注意：本 awk 程序整体被单引号包裹，因此正则里用 `.` 代替引号字符
+  #       （目标行只有 `apply plugin: 'org.jetbrains.dokka'` 与
+  #        `tasks.register('dokkaJavadocJar', Jar) {` 两种固定形态）。
+  awk '
+    /^[[:space:]]*apply[[:space:]]+plugin:[[:space:]]*.org\.jetbrains\.dokka.[[:space:]]*$/ { next }
+    skip == 0 && /tasks\.register\(.dokkaJavadocJar/ {
+      skip = 1; depth = 0
+      depth += gsub(/\{/, "{")
+      depth -= gsub(/\}/, "}")
+      if (depth <= 0) skip = 0
+      next
+    }
+    skip == 1 {
+      depth += gsub(/\{/, "{")
+      depth -= gsub(/\}/, "}")
+      if (depth <= 0) skip = 0
+      next
+    }
+    { print }
+  ' "${GRADLE_FILE}" > "${_nodokka_tmp}"
+
+  if grep -qE "org\.jetbrains\.dokka|dokkaJavadoc" "${_nodokka_tmp}"; then
+    rm -f "${_nodokka_tmp}"
+    warn "dokka 移除后仍有残留，已跳过本次改写，请手动检查 ${GRADLE_FILE}"
+  else
+    cat "${_nodokka_tmp}" > "${GRADLE_FILE}"
+    rm -f "${_nodokka_tmp}"
+    log "已移除 dokka 插件与 dokkaJavadocJar 任务（AAR 不需要 javadoc）"
+  fi
+fi
+
 # ---------------------------------------------------------------------------
 # 6. android/jni/ffmpeg/Android.mk —— prebuilt ffmpeg 库改名
 #    LOCAL_MODULE := libavcodec        -> fkit_avcodec
