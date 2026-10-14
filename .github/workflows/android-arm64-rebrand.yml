@@ -65,6 +65,13 @@ env:
   #   --arch=arm64-v8a  只编 arm v8
   #   --enable-lib-all  打开全部外部库
   #   --enable-gpl      打开 GPL 库（x264/x265/xvidcore/rubberband/libvidstab）★★ 见 README 许可说明
+  #   --disable-lib-gnutls  必须！ffmpeg 的 TLS 后端只能二选一：
+  #          --enable-lib-all 会同时打开 gnutls 和 openssl，ffmpeg configure
+  #          直接 die「GnuTLS and OpenSSL must not be enabled at the same time.」
+  #          这里保留 openssl、关掉 gnutls。反过来关 openssl 不行 ——
+  #          scripts/android/srt.sh 硬编码 -DUSE_ENCLIB=openssl -DUSE_OPENSSL_PC=1，
+  #          没有 openssl 的 .pc 时 srt 会构建失败。
+  #          （gnutls 是叶子库，依赖图里没有别的库依赖它，关掉无副作用。）
   #   --no-archive      不在构建脚本里打 AAR，改名之后再自己打
   #
   #   ★ jobs 说明：标准 ubuntu runner 只有 2 核 / 7GB 内存 / ~14GB 磁盘，
@@ -72,7 +79,7 @@ env:
   #     想更快可以调高，但内存不够时链接会直接挂。
   #   ★ 如果仍然 OOM 或磁盘不足，追加：--no-link-time-optimization
   # -------------------------------------------------------------------------
-  BUILD_OPTS: "--arch=arm64-v8a --enable-lib-all --enable-gpl --api-level=24 --no-archive --jobs=2"
+  BUILD_OPTS: "--arch=arm64-v8a --enable-lib-all --enable-gpl --disable-lib-gnutls --api-level=24 --no-archive --jobs=2"
 
 jobs:
   build:
@@ -278,14 +285,26 @@ jobs:
           echo
           echo "===== 各外部库结果汇总 ====="
           grep -E '^[a-z0-9_-]+: (ok|failed)$' build.log | tail -n 80 || true
+          echo
+          # ffmpeg 自己的 configure 会把完整命令行与每个检查项写进 ffbuild/config.log。
+          # 光看 build.log 只能看到最后那句 die 原因，看不到实际下发的 --enable-* 列表。
+          echo "===== src/ffmpeg/ffbuild/config.log 末尾 200 行 ====="
+          if [ -f src/ffmpeg/ffbuild/config.log ]; then
+            tail -n 200 src/ffmpeg/ffbuild/config.log
+          else
+            echo "(没有 ffbuild/config.log，说明还没走到 ffmpeg configure)"
+          fi
 
-      # 失败时也把 build.log 留一份，便于定位问题（成功时的上传见下一步）
+      # 失败时也把 build.log / ffbuild config.log 留一份，便于定位问题（成功时的上传见下一步）
       - name: Upload build log (on failure)
         if: failure()
         uses: actions/upload-artifact@v6
         with:
           name: build-log-${{ github.run_number }}
-          path: build.log
+          path: |
+            build.log
+            src/ffmpeg/ffbuild/config.log
+            src/ffmpeg/configure
           if-no-files-found: ignore
           retention-days: 14
 

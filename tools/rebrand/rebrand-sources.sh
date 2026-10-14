@@ -12,6 +12,8 @@
 #    5. android/jni/*.mk 里 prebuilt ffmpeg 库与包装库模块改名
 #    6. 给 scripts/android/ffmpeg.sh 注入 SLIBPREF 覆盖，让 ffmpeg 直接产出
 #       lib<前缀>_avcodec.so 等（这一步失败时由 rebrand-native.sh 兜底修正）
+#    7. 修上游 meson cross file 的 pkg-config 键名 bug（rubberband 构建失败根因）
+#    8. 给 GPL 构建补 --enable-version3（OpenSSL >= 3.0.0 的硬性要求）
 #
 #  脚本可重复执行（幂等）。
 # =============================================================================
@@ -250,7 +252,42 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 10. 结果自检 + 摘要
+# 10. 让 GPL 构建同时打开 --enable-version3
+#
+#     ffmpeg configure 里 OpenSSL 的检查是（configure:7551 附近）：
+#         enabled openssl && { { check_pkg_config openssl "openssl >= 3.0.0" ... &&
+#             { enabled gplv3 || ! enabled gpl || enabled nonfree ||
+#               die "ERROR: OpenSSL >=3.0.0 requires --enable-version3"; }; } || ... }
+#     即：一旦 --enable-gpl 且本机 OpenSSL >= 3.0.0，就必须再给 --enable-version3，
+#     否则直接 die。ffmpeg-kit 编的是 openssl-3.5.7（scripts/source.sh），满足 >= 3.0.0，
+#     而 scripts/android/ffmpeg.sh 只在 GPL_ENABLED=yes 时加了 --enable-gpl，
+#     从来没加过 --enable-version3 —— 于是 GPL 全量构建必然卡在这一步。
+#
+#     另有一个同类隐患（configure:4831）：
+#         map "die_license_disabled version3" $EXTERNAL_LIBRARY_VERSION3_LIST ...
+#     会对 gmp / libopencore_amrnb / libopencore_amrwb / libvo_amrwbenc 这些
+#     version3-only 的库报「xxx is version3 and --enable-version3 is not specified」。
+#     这次 GPL 全量构建里 gmp、opencore-amr、vo-amrwbenc 都是开的，同样依赖这个开关。
+#     加上 --enable-version3 一并消除。
+#
+#     许可影响：--enable-gpl + --enable-version3 => GPL version 3 or later。
+#     本构建里 rubberband v4 本身就是 GPL-3.0-or-later，产物本来就已经是 GPLv3，
+#     所以这里只是把许可声明对齐，不引入新的许可约束。
+# ---------------------------------------------------------------------------
+VER3_FLAG='CONFIGURE_POSTFIX+=" --enable-version3"'
+if grep -qF "${VER3_FLAG}" "${FFMPEG_SH}"; then
+  log "ffmpeg.sh 已注入 --enable-version3（跳过）"
+else
+  grep -qF 'CONFIGURE_POSTFIX+=" --enable-gpl"' "${FFMPEG_SH}" \
+    || die "在 ${FFMPEG_SH##*/} 里找不到 CONFIGURE_POSTFIX+=\" --enable-gpl\"，上游结构可能已变"
+  sed -i 's|^  CONFIGURE_POSTFIX+=" --enable-gpl"$|  CONFIGURE_POSTFIX+=" --enable-gpl"\n  CONFIGURE_POSTFIX+=" --enable-version3"|' "${FFMPEG_SH}"
+  grep -qF "${VER3_FLAG}" "${FFMPEG_SH}" || die "--enable-version3 注入失败"
+  grep -qF 'CONFIGURE_POSTFIX+=" --enable-gpl"' "${FFMPEG_SH}" || die "注入后 --enable-gpl 丢失"
+  log "已注入 --enable-version3（OpenSSL >= 3.0.0 + GPL 的硬性要求）"
+fi
+
+# ---------------------------------------------------------------------------
+# 11. 结果自检 + 摘要
 # ---------------------------------------------------------------------------
 printf '\n'
 log "==== 改名配置摘要 ===="
@@ -270,4 +307,4 @@ log "AAR 文件名: ${REBRAND_ARCHIVE_NAME}-release.aar"
 printf '\n'
 log "如需还原源码改名：git checkout . （本脚本只修改受 git 管理的文件）"
 printf '\n'
-log "下一步：./android.sh --arch=arm64-v8a --enable-lib-all --enable-gpl --no-archive --package-name=${NEW_PKG}"
+log "下一步：./android.sh --arch=arm64-v8a --enable-lib-all --enable-gpl --disable-lib-gnutls --no-archive --package-name=${NEW_PKG}"
